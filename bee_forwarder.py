@@ -1,40 +1,50 @@
 import serial
 import time
-from datetime import datetime, timezone
-import json
 import socket
 from queue import Queue
+import threading
 
 # Configure serial connection to XBee
-SERIAL_PORT = '/dev/tty.usbserial-D30H6XKE'  # macOS serial port
+SERIAL_PORT = '/dev/ttyUSB0'
 BAUD_RATE = 9600
-TCP_HOST = '13.56.119.10'  # Replace with your public IP or ngrok address
+TCP_HOST = 'nam1.cloud.thethings.network'  # Replace with your public IP
 TCP_PORT = 1700
 
-# Gateway EUI (8 bytes) - replace with your gateway's EUI
-GATEWAY_EUI = bytes.fromhex('0016C001FF13BD44')  # Example: AA555A0000000101
+# Queue for incoming packets
+packet_queue = Queue()
 
 def send_at_command(ser, command, wait_time=1):
     """Send AT command and return response"""
     ser.write((command + '\r').encode())
     time.sleep(wait_time)
     response = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
-    print(f"Command: {command}")
-    print(f"Response: {response}")
-    return response
+    print(f"AT Command: {command} => Response: {response.strip()}")
+    return response.strip()
 
 
-def downlink_interceptor(sock):
-    """Listens for incoming UDP packets on localhost:1700 for downlink"""
-    print("Listening for downlink UDP packets on localhost:1700...")
-    while True:
-        data, addr = sock.recvfrom(4096)
-        print(f"Received downlink packet from {addr}: {data}")
-        # Process downlink packet as needed
+def initialize_xbee(ser):
+    """Configure XBee destination IP and port once at startup"""
+    try:
+        print("Entering AT command mode...")
+        time.sleep(1)
+        ser.write(b'+++')
+        time.sleep(1.5)
+        response = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+        print(f"Command mode response: {response.strip()}")
+
+        # Configure UDP settings
+        send_at_command(ser, f'ATDL {TCP_HOST}')  # Destination IP
+        send_at_command(ser, f'ATDE {hex(TCP_PORT)[2:]}')  # Destination port (hex)
+        send_at_command(ser, 'ATIP 0')  # UDP mode
+        send_at_command(ser, 'ATWR')  # Write settings
+        send_at_command(ser, 'ATCN')  # Exit command mode
+        print("XBee initialized successfully!\n")
+    except serial.SerialException as e:
+        print(f"Serial initialization error: {e}")
 
 
-def uplink_interceptor(sock, packet_queue):
-    """Listens to localhost:18500 for incoming UDP packets"""
+def uplink_interceptor(sock):
+    """Listen for incoming UDP packets"""
     print("Listening for incoming UDP packets on localhost:18500...")
     while True:
         data, addr = sock.recvfrom(4096)
@@ -42,72 +52,78 @@ def uplink_interceptor(sock, packet_queue):
         packet_queue.put(data)
 
 
-def process_and_send_packet(packet):
-    try:
-        # Open serial connection
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=2)
-        print(f"Connected to {SERIAL_PORT} at {BAUD_RATE} baud")
-        time.sleep(2)
-        
-        # Enter AT command mode
-        time.sleep(1)
-        ser.write(b'+++')
-        time.sleep(1.5)
-        response = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
-        print(f"Command mode response: {response}")
-        
-        # Configure UDP settings
-        send_at_command(ser, f'ATDL {TCP_HOST}')  # Set destination IP
-        send_at_command(ser, f'ATDE {hex(TCP_PORT)[2:]}')  # Set destination port (hex)
-        send_at_command(ser, 'ATIP 0')  # Set to UDP mode
-        send_at_command(ser, 'ATWR')  # Write settings
-        send_at_command(ser, 'ATCN')  # Exit command mode
-
-        print("\nSending UDP packets...")
-        # Send UDP packets
-        message = packet
-        ser.write(message)
-        print(f"Sent: {message}")
-        time.sleep(2)
-        for i in range(5):
-            message = create_push_data_packet()
-            ser.write(message)
-            print(f"Sent: {message}")
-            time.sleep(2)
-        
-        ser.write(b'+++')
-        send_at_command(ser, 'ATCN')  # Exit command mode
-        ser.close()
-        print("\nDone!")
-        
-    except serial.SerialException as e:
-        print(f"Serial error: {e}")
-    except Exception as e:
-        print(f"Error: {e}")
-
-
-def forwarder(packet_queue):
-    """Processes and forwards packets from the queue via XBee"""
+def downlink_interceptor(sock):
+    """Listen for downlink UDP packets (optional)"""
+    print("Listening for downlink UDP packets on localhost:1700...")
     while True:
-        if not packet_queue.empty():
-            packet = packet_queue.get()
-            process_and_send_packet(packet)
+        data, addr = sock.recvfrom(4096)
+        print(f"Received downlink packet from {addr}: {data}")
 
+
+def forwarder_old(ser):
+    """Forward queued packets via XBee"""
+    while True:
+        packet = packet_queue.get()
+        try:
+            # Ensure packet is bytes
+            if isinstance(packet, str):
+                packet = packet.encode('utf-8')
+            ser.write(packet)
+            print(f"Sent: {packet}")
+        except serial.SerialException as e:
+            print(f"Serial write error: {e}")
+        time.sleep(0.5)  # Avoid overwhelming the XBee
+
+def forwarder(ser):
+    """Forward queued packets via XBee safely"""
+    while True:
+        packet = packet_queue.get()
+        try:
+            # Ensure packet is bytes
+            if isinstance(packet, str):
+                packet = packet.encode('utf-8')
+            
+            # Split packet into smaller chunks (max 100 bytes)
+            MAX_CHUNK = 90
+            for i in range(0, len(packet), MAX_CHUNK):
+                chunk = packet[i:i+MAX_CHUNK]
+                ser.write(chunk)
+                print(f"Sent chunk: {chunk}")
+                time.sleep(0.5)  # Give XBee time to process
+        except serial.SerialException as e:
+            print(f"Serial write error: {e}")
+            # Optionally: reinitialize XBee if connection lost
+            try:
+                initialize_xbee(ser)
+            except:
+                print("Failed to reinitialize XBee, skipping packet.")
 
 if __name__ == "__main__":
-    downlink_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    downlink_sock.bind(('localhost', 1700))
+    # Initialize serial
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=2)
+        print(f"Connected to {SERIAL_PORT} at {BAUD_RATE} baud")
+    except serial.SerialException as e:
+        print(f"Failed to connect to serial port: {e}")
+        exit(1)
+
+    # Initialize XBee once
+    initialize_xbee(ser)
+
+    # Setup UDP sockets
     uplink_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     uplink_sock.bind(('localhost', 18500))
-    packet_queue = Queue()
 
-    uplink_thread = threading.Thread(target=uplink_interceptor, args=(uplink_sock, packet_queue,))
-    uplink_thread.daemon = True
-    downlink_thread = threading.Thread(target=downlink_interceptor, args=(downlink_sock,))
-    downlink_thread.daemon = True
-    forwarder_thread = threading.Thread(target=forwarder, args=(packet_queue,))
-    forwarder_thread.daemon = True
+    downlink_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    downlink_sock.bind(('localhost', 1700))
 
-    uplink_thread.start()
-    downlink_thread.start()
-    forwarder_thread.start()
+    # Start threads
+    threading.Thread(target=uplink_interceptor, args=(uplink_sock,), daemon=True).start()
+    threading.Thread(target=downlink_interceptor, args=(downlink_sock,), daemon=True).start()
+    threading.Thread(target=forwarder, args=(ser,), daemon=True).start()
+
+    # Keep main thread alive
+    print("Gateway running. Press Ctrl+C to exit.")
+    while True:
+        time.sleep(1)
+
