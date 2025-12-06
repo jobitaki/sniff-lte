@@ -7,7 +7,8 @@ import threading
 # Configure serial connection to XBee
 SERIAL_PORT = '/dev/ttyUSB0'
 BAUD_RATE = 9600
-TCP_HOST = 'nam1.cloud.thethings.network'  # Replace with your public IP
+#TCP_HOST = 'nam1.cloud.thethings.network'  # Replace with your public IP
+TCP_HOST = '13.56.119.10'  # Replace with your public IP or ngrok address
 TCP_PORT = 1700
 
 # Queue for incoming packets
@@ -84,12 +85,17 @@ def forwarder(ser):
                 packet = packet.encode('utf-8')
             
             # Split packet into smaller chunks (max 100 bytes)
-            MAX_CHUNK = 90
+            MAX_CHUNK = 200
             for i in range(0, len(packet), MAX_CHUNK):
                 chunk = packet[i:i+MAX_CHUNK]
                 ser.write(chunk)
                 print(f"Sent chunk: {chunk}")
                 time.sleep(0.5)  # Give XBee time to process
+
+            time.sleep(2)
+            ser.write(b'+++')
+            send_at_command(ser, 'ATCN')  # Exit command mode
+            time.sleep(0.5)
         except serial.SerialException as e:
             print(f"Serial write error: {e}")
             # Optionally: reinitialize XBee if connection lost
